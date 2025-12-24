@@ -1,4 +1,4 @@
-module github.com/gryaznovart186/tool
+module github.com/gryaznovart186/tools
 
 go 1.25.5
 
