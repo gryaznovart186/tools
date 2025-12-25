@@ -52,7 +52,7 @@ func (c *Client) SendText(msg string) error {
 	}
 
 	reps, err := c.restyClient.
-		SetTimeout(timeout).
+		SetTimeout(c.timeout).
 		R().
 		SetQueryParams(params).
 		Post(c.botUrl() + "/sendMessage")
