@@ -20,6 +20,10 @@ func NewClient(addr string, opts ...Opt) *Client {
 	return &Client{rc: rc}
 }
 
+func (c *Client) C() *redis.Client {
+	return c.rc
+}
+
 func WithDB(db int) Opt {
 	return func(o *redis.Options) {
 		o.DB = db
