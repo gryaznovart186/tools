@@ -22,7 +22,8 @@ func New(lvl, format string) *slog.Logger {
 	default:
 		panic("invalid logging format, use json or text")
 	}
-	return slog.New(handler)
+
+	return slog.New(&ContextHandler{Handler: handler})
 }
 
 // logLevel maps a string log level to a corresponding slog.Level. Defaults to slog.LevelInfo for unrecognized levels.
