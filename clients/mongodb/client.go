@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 const (
@@ -34,7 +34,7 @@ func New(uri, dbName string, clientOpts ...Opt) (*Client, error) {
 		opt(o)
 	}
 
-	client, err := mongo.Connect(context.Background(), o)
+	client, err := mongo.Connect(o)
 	if err != nil {
 		return nil, fmt.Errorf("mongo connect error: %w", err)
 	}
