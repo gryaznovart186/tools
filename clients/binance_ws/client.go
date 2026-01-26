@@ -136,9 +136,9 @@ func (c *BinanceWebsocketClient) newConnection() *connection {
 
 func (conn *connection) ensureConnected() error {
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
 
 	if conn.conn != nil {
+		conn.mu.Unlock()
 		return nil
 	}
 
@@ -149,6 +149,7 @@ func (conn *connection) ensureConnected() error {
 
 	c, _, err := conn.client.dialer.DialContext(conn.ctx, conn.client.endpoint, nil)
 	if err != nil {
+		conn.mu.Unlock()
 		return err
 	}
 
@@ -180,10 +181,12 @@ func (conn *connection) ensureConnected() error {
 				_ = conn.conn.Close()
 				conn.conn = nil
 			}
+			conn.mu.Unlock()
 			return err
 		}
 	}
 
+	conn.mu.Unlock()
 	return nil
 }
 
