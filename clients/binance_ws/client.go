@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -67,16 +68,13 @@ type BinanceWebsocketClient struct {
 	dialer   *websocket.Dialer
 
 	mu     sync.RWMutex
-	conn   *websocket.Conn
-	ctx    context.Context
+	conns  []*connection
+	ctx    context.Context // Global context for all connections
 	cancel context.CancelFunc
 
-	// write operations channel for serialization
-	writeCh chan writeRequest
-
-	// active subscriptions (set)
-	streams map[string]struct{}
-	reqID   int
+	// global stream map to find which connection serves which stream
+	streams map[string]*connection
+	reqID   int64
 
 	// ping/pong
 	pingInterval time.Duration
@@ -87,6 +85,20 @@ type BinanceWebsocketClient struct {
 
 	// state
 	configured bool
+
+	// message channel for ReadLoop
+	dataCh chan *StreamData
+}
+
+type connection struct {
+	client *BinanceWebsocketClient
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	writeCh chan writeRequest
+	streams map[string]struct{}
+	mu      sync.Mutex
 }
 
 type writeRequest struct {
@@ -100,7 +112,8 @@ func NewClient(opts ...Option) *BinanceWebsocketClient {
 		pingInterval:     defaultPingInterval,
 		pongTimeout:      defaultPongTimeout,
 		maxSubscriptions: defaultMaxSubscriptions,
-		streams:          make(map[string]struct{}),
+		streams:          make(map[string]*connection),
+		dataCh:           make(chan *StreamData, 1000),
 		dialer: &websocket.Dialer{
 			Proxy:            http.ProxyFromEnvironment,
 			HandshakeTimeout: defaultHandshakeTimeout,
@@ -129,226 +142,132 @@ func (c *BinanceWebsocketClient) WithTestnet() error {
 	return nil
 }
 
-func (c *BinanceWebsocketClient) Connect(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn != nil {
-		return ErrAlreadyConnected
+func (c *BinanceWebsocketClient) newConnection() *connection {
+	return &connection{
+		client:  c,
+		streams: make(map[string]struct{}),
 	}
-
-	return c.connectLocked(ctx)
 }
 
-// connectLocked establishes connection, must be called with mu locked
-func (c *BinanceWebsocketClient) connectLocked(ctx context.Context) error {
-	// Cancel previous context if exists
-	if c.cancel != nil {
-		c.cancel()
+func (conn *connection) ensureConnected() error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if conn.conn != nil {
+		return nil
 	}
 
-	c.ctx, c.cancel = context.WithCancel(ctx)
-	c.configured = true
+	conn.ctx, conn.cancel = context.WithCancel(conn.client.ctx)
 
-	conn, _, err := c.dialer.DialContext(c.ctx, c.endpoint, nil)
+	c, _, err := conn.client.dialer.DialContext(conn.ctx, conn.client.endpoint, nil)
 	if err != nil {
 		return err
 	}
 
-	conn.SetReadDeadline(time.Now().Add(c.pongTimeout))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(c.pongTimeout))
+	c.SetReadDeadline(time.Now().Add(conn.client.pongTimeout))
+	c.SetPongHandler(func(string) error {
+		c.SetReadDeadline(time.Now().Add(conn.client.pongTimeout))
 		return nil
 	})
 
-	c.conn = conn
-	c.writeCh = make(chan writeRequest, 100)
+	conn.conn = c
+	conn.writeCh = make(chan writeRequest, 100)
 
-	// Start write pump
-	go c.writePump()
-
-	// Start ping pump
-	go c.pingPump()
+	go conn.writePump()
+	go conn.pingPump()
 
 	// Restore subscriptions
-	if len(c.streams) > 0 {
-		all := make([]string, 0, len(c.streams))
-		for s := range c.streams {
+	if len(conn.streams) > 0 {
+		all := make([]string, 0, len(conn.streams))
+		for s := range conn.streams {
 			all = append(all, s)
 		}
-		return c.sendLocked("SUBSCRIBE", all)
+		// Send subscribe command
+		go func() {
+			_ = conn.send("SUBSCRIBE", all)
+		}()
 	}
 
 	return nil
 }
 
-// writePump handles all write operations to avoid concurrent writes
-func (c *BinanceWebsocketClient) writePump() {
+func (conn *connection) reconnect() {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if conn.cancel != nil {
+		conn.cancel()
+		conn.cancel = nil
+	}
+
+	if conn.writeCh != nil {
+		close(conn.writeCh)
+		conn.writeCh = nil
+	}
+
+	if conn.conn != nil {
+		_ = conn.conn.Close()
+		conn.conn = nil
+	}
+}
+
+func (conn *connection) writePump() {
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-conn.ctx.Done():
 			return
-		case req, ok := <-c.writeCh:
+		case req, ok := <-conn.writeCh:
 			if !ok {
 				return
 			}
 
-			c.mu.RLock()
-			conn := c.conn
-			c.mu.RUnlock()
+			conn.mu.Lock()
+			c := conn.conn
+			conn.mu.Unlock()
 
-			if conn == nil {
+			if c == nil {
 				req.result <- ErrNotConnected
 				continue
 			}
 
-			err := conn.WriteMessage(websocket.TextMessage, req.data)
+			err := c.WriteMessage(websocket.TextMessage, req.data)
 			req.result <- err
 		}
 	}
 }
 
-// pingPump sends periodic ping messages
-func (c *BinanceWebsocketClient) pingPump() {
-	ticker := time.NewTicker(c.pingInterval)
+func (conn *connection) pingPump() {
+	ticker := time.NewTicker(conn.client.pingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-conn.ctx.Done():
 			return
 		case <-ticker.C:
-			c.mu.RLock()
-			conn := c.conn
-			c.mu.RUnlock()
+			conn.mu.Lock()
+			c := conn.conn
+			conn.mu.Unlock()
 
-			if conn == nil {
+			if c == nil {
 				return
 			}
 
-			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
-				// Ping failed, close connection to trigger reconnection
-				c.mu.Lock()
-				if c.conn != nil {
-					_ = c.closeLocked()
-				}
-				c.mu.Unlock()
+			if err := c.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				conn.reconnect()
 				return
 			}
 		}
 	}
 }
 
-func (c *BinanceWebsocketClient) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.closeLocked()
-}
-
-// closeLocked closes connection, must be called with mu locked
-func (c *BinanceWebsocketClient) closeLocked() error {
-	if c.cancel != nil {
-		c.cancel()
-		c.cancel = nil
-	}
-
-	if c.writeCh != nil {
-		close(c.writeCh)
-		c.writeCh = nil
-	}
-
-	if c.conn == nil {
-		return nil
-	}
-
-	_ = c.conn.WriteControl(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		time.Now().Add(time.Second),
-	)
-
-	err := c.conn.Close()
-	c.conn = nil
-	return err
-}
-
-func (c *BinanceWebsocketClient) Subscribe(streams ...string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return ErrNotConnected
-	}
-
-	var toSubscribe []string
-
-	for _, s := range streams {
-		// Validate stream name
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return ErrEmptyStream
-		}
-
-		if _, ok := c.streams[s]; ok {
-			continue
-		}
-
-		// Check subscription limit
-		if len(c.streams) >= c.maxSubscriptions {
-			return ErrMaxSubscriptions
-		}
-
-		c.streams[s] = struct{}{}
-		toSubscribe = append(toSubscribe, s)
-	}
-
-	if len(toSubscribe) == 0 {
-		return nil
-	}
-
-	return c.sendLocked("SUBSCRIBE", toSubscribe)
-}
-
-func (c *BinanceWebsocketClient) Unsubscribe(streams ...string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return ErrNotConnected
-	}
-
-	var toUnsubscribe []string
-
-	for _, s := range streams {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-
-		if _, ok := c.streams[s]; !ok {
-			continue
-		}
-		delete(c.streams, s)
-		toUnsubscribe = append(toUnsubscribe, s)
-	}
-
-	if len(toUnsubscribe) == 0 {
-		return nil
-	}
-
-	return c.sendLocked("UNSUBSCRIBE", toUnsubscribe)
-}
-
-// sendLocked prepares and sends a message, must be called with mu locked
-// It unlocks the mutex before sending to avoid deadlock with writePump
-func (c *BinanceWebsocketClient) sendLocked(method string, streams []string) error {
-	c.reqID++
+func (conn *connection) send(method string, streams []string) error {
+	id := atomic.AddInt64(&conn.client.reqID, 1)
 
 	msg := map[string]any{
 		"method": method,
 		"params": streams,
-		"id":     c.reqID,
+		"id":     id,
 	}
 
 	data, err := json.Marshal(msg)
@@ -356,17 +275,14 @@ func (c *BinanceWebsocketClient) sendLocked(method string, streams []string) err
 		return err
 	}
 
-	// Use write channel to avoid concurrent writes
-	if c.writeCh == nil {
+	conn.mu.Lock()
+	writeCh := conn.writeCh
+	ctx := conn.ctx
+	conn.mu.Unlock()
+
+	if writeCh == nil {
 		return ErrNotConnected
 	}
-
-	writeCh := c.writeCh
-	ctx := c.ctx
-
-	// Unlock before sending to avoid deadlock with writePump
-	c.mu.Unlock()
-	defer c.mu.Lock()
 
 	result := make(chan error, 1)
 	select {
@@ -377,58 +293,229 @@ func (c *BinanceWebsocketClient) sendLocked(method string, streams []string) err
 	}
 }
 
-func (c *BinanceWebsocketClient) read() ([]byte, error) {
-	c.mu.RLock()
-	conn := c.conn
-	c.mu.RUnlock()
+func (conn *connection) run() {
+	for {
+		select {
+		case <-conn.client.ctx.Done():
+			return
+		default:
+		}
 
-	if conn == nil {
-		return nil, ErrNotConnected
+		if err := conn.ensureConnected(); err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		conn.mu.Lock()
+		c := conn.conn
+		conn.mu.Unlock()
+
+		if c == nil {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		_, msg, err := c.ReadMessage()
+		if err != nil {
+			conn.reconnect()
+			time.Sleep(time.Second)
+			continue
+		}
+
+		var streamMsg StreamData
+		if err := json.Unmarshal(msg, &streamMsg); err != nil {
+			continue
+		}
+
+		if streamMsg.Stream == "" {
+			continue
+		}
+
+		select {
+		case conn.client.dataCh <- &streamMsg:
+		case <-conn.client.ctx.Done():
+			return
+		}
 	}
-
-	_, msg, err := conn.ReadMessage()
-	return msg, err
 }
 
-// ReadLoop reads messages from the WebSocket connection and passes them to the handler.
-// It returns an error when the connection is closed or an error occurs.
-// Reconnection logic should be handled by the caller.
+func (c *BinanceWebsocketClient) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.ctx != nil {
+		return ErrAlreadyConnected
+	}
+
+	c.ctx, c.cancel = context.WithCancel(ctx)
+	c.configured = true
+
+	conn := c.newConnection()
+	c.conns = append(c.conns, conn)
+
+	if err := conn.ensureConnected(); err != nil {
+		return err
+	}
+
+	go conn.run()
+
+	return nil
+}
+
+func (c *BinanceWebsocketClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+
+	for _, conn := range c.conns {
+		conn.reconnect()
+	}
+	c.conns = nil
+	c.streams = make(map[string]*connection)
+
+	return nil
+}
+
+func (c *BinanceWebsocketClient) Subscribe(streams ...string) error {
+	c.mu.Lock()
+	if c.ctx == nil {
+		c.mu.Unlock()
+		return ErrNotConnected
+	}
+
+	groups := make(map[*connection][]string)
+
+	for _, s := range streams {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			c.mu.Unlock()
+			return ErrEmptyStream
+		}
+
+		if _, ok := c.streams[s]; ok {
+			continue
+		}
+
+		// Find connection with space
+		var targetConn *connection
+		for _, conn := range c.conns {
+			conn.mu.Lock()
+			count := len(conn.streams)
+			conn.mu.Unlock()
+
+			if count < c.maxSubscriptions {
+				targetConn = conn
+				break
+			}
+		}
+
+		if targetConn == nil {
+			targetConn = c.newConnection()
+			c.conns = append(c.conns, targetConn)
+			if err := targetConn.ensureConnected(); err != nil {
+				c.mu.Unlock()
+				return err
+			}
+			go targetConn.run()
+		}
+
+		targetConn.mu.Lock()
+		targetConn.streams[s] = struct{}{}
+		targetConn.mu.Unlock()
+
+		c.streams[s] = targetConn
+		groups[targetConn] = append(groups[targetConn], s)
+	}
+	c.mu.Unlock()
+
+	// Send SUBSCRIBE messages outside of client lock
+	for conn, sList := range groups {
+		if err := conn.send("SUBSCRIBE", sList); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *BinanceWebsocketClient) Unsubscribe(streams ...string) error {
+	c.mu.Lock()
+	if c.ctx == nil {
+		c.mu.Unlock()
+		return ErrNotConnected
+	}
+
+	// Group streams by connection
+	groups := make(map[*connection][]string)
+
+	for _, s := range streams {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+
+		conn, ok := c.streams[s]
+		if !ok {
+			continue
+		}
+
+		groups[conn] = append(groups[conn], s)
+		delete(c.streams, s)
+
+		conn.mu.Lock()
+		delete(conn.streams, s)
+		conn.mu.Unlock()
+	}
+	c.mu.Unlock()
+
+	for conn, s := range groups {
+		if err := conn.send("UNSUBSCRIBE", s); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (c *BinanceWebsocketClient) ReadLoop(ctx context.Context, handler func(ctx context.Context, data *StreamData)) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		case data, ok := <-c.dataCh:
+			if !ok {
+				return nil
+			}
+			handler(ctx, data)
 		}
-
-		msg, err := c.read()
-		if err != nil {
-			return err
-		}
-		var streamMsg StreamData
-		if err := json.Unmarshal(msg, &streamMsg); err != nil {
-			return err
-		}
-
-		// Ignore subscribe/unsubcribe confirmation messages
-		if streamMsg.Stream == "" {
-			continue
-		}
-
-		handler(ctx, &streamMsg)
 	}
 }
 
-// SubscriptionCount returns the current number of active subscriptions
 func (c *BinanceWebsocketClient) SubscriptionCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.streams)
 }
 
-// IsConnected returns true if the client is currently connected
 func (c *BinanceWebsocketClient) IsConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.conn != nil
+	if len(c.conns) == 0 {
+		return false
+	}
+	for _, conn := range c.conns {
+		conn.mu.Lock()
+		connected := conn.conn != nil
+		conn.mu.Unlock()
+		if !connected {
+			return false
+		}
+	}
+	return true
 }
