@@ -21,6 +21,7 @@ type RateLimit struct {
 }
 
 type SymbolInfo struct {
+	Symbol  string         `json:"symbol"`
 	Pair    string         `json:"pair"`
 	Status  string         `json:"status"`
 	Filters []SymbolFilter `json:"filters"`

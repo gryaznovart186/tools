@@ -88,6 +88,7 @@ type BinanceWebsocketClient struct {
 
 	// message channel for ReadLoop
 	dataCh chan *StreamData
+	wg     sync.WaitGroup
 }
 
 type connection struct {
@@ -127,19 +128,6 @@ func NewClient(opts ...Option) *BinanceWebsocketClient {
 	}
 
 	return c
-}
-
-// WithTestnet configures the client to connect to the Binance Testnet by setting the WebSocket endpoint.
-func (c *BinanceWebsocketClient) WithTestnet() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.configured {
-		return ErrClientNotConfigured
-	}
-
-	c.endpoint = testWsBaseEndpoint
-	return nil
 }
 
 func (c *BinanceWebsocketClient) newConnection() *connection {
@@ -254,7 +242,7 @@ func (conn *connection) pingPump() {
 			}
 
 			if err := c.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
-				conn.reconnect()
+				go conn.reconnect()
 				return
 			}
 		}
@@ -276,19 +264,28 @@ func (conn *connection) send(method string, streams []string) error {
 	}
 
 	conn.mu.Lock()
-	writeCh := conn.writeCh
-	ctx := conn.ctx
-	conn.mu.Unlock()
-
-	if writeCh == nil {
+	if conn.writeCh == nil {
+		conn.mu.Unlock()
 		return ErrNotConnected
 	}
 
+	writeCh := conn.writeCh
+	ctx := conn.ctx
+
 	result := make(chan error, 1)
+	req := writeRequest{data: data, result: result}
+
 	select {
-	case writeCh <- writeRequest{data: data, result: result}:
-		return <-result
+	case writeCh <- req:
+		conn.mu.Unlock()
+		select {
+		case err := <-result:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	case <-ctx.Done():
+		conn.mu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -357,15 +354,17 @@ func (c *BinanceWebsocketClient) Connect(ctx context.Context) error {
 		return err
 	}
 
-	go conn.run()
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		conn.run()
+	}()
 
 	return nil
 }
 
 func (c *BinanceWebsocketClient) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.cancel != nil {
 		c.cancel()
 		c.cancel = nil
@@ -376,6 +375,16 @@ func (c *BinanceWebsocketClient) Close() error {
 	}
 	c.conns = nil
 	c.streams = make(map[string]*connection)
+	c.mu.Unlock()
+
+	c.wg.Wait()
+
+	c.mu.Lock()
+	if c.dataCh != nil {
+		close(c.dataCh)
+		c.dataCh = nil
+	}
+	c.mu.Unlock()
 
 	return nil
 }
@@ -420,7 +429,11 @@ func (c *BinanceWebsocketClient) Subscribe(streams ...string) error {
 				c.mu.Unlock()
 				return err
 			}
-			go targetConn.run()
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				targetConn.run()
+			}()
 		}
 
 		targetConn.mu.Lock()
@@ -482,13 +495,22 @@ func (c *BinanceWebsocketClient) Unsubscribe(streams ...string) error {
 }
 
 func (c *BinanceWebsocketClient) ReadLoop(ctx context.Context, handler func(ctx context.Context, data *StreamData)) error {
+	c.mu.RLock()
+	clientCtx := c.ctx
+	dataCh := c.dataCh
+	c.mu.RUnlock()
+
+	if clientCtx == nil {
+		return ErrNotConnected
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-c.ctx.Done():
-			return c.ctx.Err()
-		case data, ok := <-c.dataCh:
+		case <-clientCtx.Done():
+			return clientCtx.Err()
+		case data, ok := <-dataCh:
 			if !ok {
 				return nil
 			}
