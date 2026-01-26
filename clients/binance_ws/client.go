@@ -83,9 +83,6 @@ type BinanceWebsocketClient struct {
 	// limits
 	maxSubscriptions int
 
-	// state
-	configured bool
-
 	// message channel for ReadLoop
 	dataCh chan *StreamData
 	wg     sync.WaitGroup
@@ -145,6 +142,9 @@ func (conn *connection) ensureConnected() error {
 		return nil
 	}
 
+	if conn.cancel != nil {
+		conn.cancel()
+	}
 	conn.ctx, conn.cancel = context.WithCancel(conn.client.ctx)
 
 	c, _, err := conn.client.dialer.DialContext(conn.ctx, conn.client.endpoint, nil)
@@ -161,6 +161,7 @@ func (conn *connection) ensureConnected() error {
 	conn.conn = c
 	conn.writeCh = make(chan writeRequest, 100)
 
+	conn.client.wg.Add(2)
 	go conn.writePump()
 	go conn.pingPump()
 
@@ -170,10 +171,17 @@ func (conn *connection) ensureConnected() error {
 		for s := range conn.streams {
 			all = append(all, s)
 		}
-		// Send subscribe command
-		go func() {
-			_ = conn.send("SUBSCRIBE", all)
-		}()
+
+		conn.mu.Unlock()
+		err := conn.send("SUBSCRIBE", all)
+		conn.mu.Lock()
+		if err != nil {
+			if conn.conn != nil {
+				_ = conn.conn.Close()
+				conn.conn = nil
+			}
+			return err
+		}
 	}
 
 	return nil
@@ -199,6 +207,8 @@ func (conn *connection) reconnect() {
 }
 
 func (conn *connection) writePump() {
+	defer conn.client.wg.Done()
+
 	conn.mu.Lock()
 	writeCh := conn.writeCh
 	ctx := conn.ctx
@@ -229,6 +239,7 @@ func (conn *connection) writePump() {
 				continue
 			}
 
+			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			err := c.WriteMessage(websocket.TextMessage, req.data)
 			select {
 			case req.result <- err:
@@ -239,6 +250,8 @@ func (conn *connection) writePump() {
 }
 
 func (conn *connection) pingPump() {
+	defer conn.client.wg.Done()
+
 	conn.mu.Lock()
 	ctx := conn.ctx
 	conn.mu.Unlock()
@@ -369,20 +382,19 @@ func (c *BinanceWebsocketClient) Connect(ctx context.Context) error {
 	if c.dataCh == nil {
 		c.dataCh = make(chan *StreamData, 1000)
 	}
-	c.configured = true
 
 	conn := c.newConnection()
 	c.conns = append(c.conns, conn)
-
-	if err := conn.ensureConnected(); err != nil {
-		return err
-	}
 
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		conn.run()
 	}()
+
+	if err := conn.ensureConnected(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -451,15 +463,17 @@ func (c *BinanceWebsocketClient) Subscribe(streams ...string) error {
 		if targetConn == nil {
 			targetConn = c.newConnection()
 			c.conns = append(c.conns, targetConn)
-			if err := targetConn.ensureConnected(); err != nil {
-				c.mu.Unlock()
-				return err
-			}
+
 			c.wg.Add(1)
 			go func() {
 				defer c.wg.Done()
 				targetConn.run()
 			}()
+
+			if err := targetConn.ensureConnected(); err != nil {
+				c.mu.Unlock()
+				return err
+			}
 		}
 
 		targetConn.mu.Lock()
