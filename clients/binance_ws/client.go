@@ -189,7 +189,6 @@ func (conn *connection) reconnect() {
 	}
 
 	if conn.writeCh != nil {
-		close(conn.writeCh)
 		conn.writeCh = nil
 	}
 
@@ -200,11 +199,20 @@ func (conn *connection) reconnect() {
 }
 
 func (conn *connection) writePump() {
+	conn.mu.Lock()
+	writeCh := conn.writeCh
+	ctx := conn.ctx
+	conn.mu.Unlock()
+
+	if writeCh == nil || ctx == nil {
+		return
+	}
+
 	for {
 		select {
-		case <-conn.ctx.Done():
+		case <-ctx.Done():
 			return
-		case req, ok := <-conn.writeCh:
+		case req, ok := <-writeCh:
 			if !ok {
 				return
 			}
@@ -214,23 +222,37 @@ func (conn *connection) writePump() {
 			conn.mu.Unlock()
 
 			if c == nil {
-				req.result <- ErrNotConnected
+				select {
+				case req.result <- ErrNotConnected:
+				default:
+				}
 				continue
 			}
 
 			err := c.WriteMessage(websocket.TextMessage, req.data)
-			req.result <- err
+			select {
+			case req.result <- err:
+			default:
+			}
 		}
 	}
 }
 
 func (conn *connection) pingPump() {
+	conn.mu.Lock()
+	ctx := conn.ctx
+	conn.mu.Unlock()
+
+	if ctx == nil {
+		return
+	}
+
 	ticker := time.NewTicker(conn.client.pingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-conn.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			conn.mu.Lock()
@@ -271,13 +293,13 @@ func (conn *connection) send(method string, streams []string) error {
 
 	writeCh := conn.writeCh
 	ctx := conn.ctx
+	conn.mu.Unlock()
 
 	result := make(chan error, 1)
 	req := writeRequest{data: data, result: result}
 
 	select {
 	case writeCh <- req:
-		conn.mu.Unlock()
 		select {
 		case err := <-result:
 			return err
@@ -285,7 +307,6 @@ func (conn *connection) send(method string, streams []string) error {
 			return ctx.Err()
 		}
 	case <-ctx.Done():
-		conn.mu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -345,6 +366,9 @@ func (c *BinanceWebsocketClient) Connect(ctx context.Context) error {
 	}
 
 	c.ctx, c.cancel = context.WithCancel(ctx)
+	if c.dataCh == nil {
+		c.dataCh = make(chan *StreamData, 1000)
+	}
 	c.configured = true
 
 	conn := c.newConnection()
@@ -373,13 +397,15 @@ func (c *BinanceWebsocketClient) Close() error {
 	for _, conn := range c.conns {
 		conn.reconnect()
 	}
-	c.conns = nil
-	c.streams = make(map[string]*connection)
 	c.mu.Unlock()
 
 	c.wg.Wait()
 
 	c.mu.Lock()
+	c.ctx = nil
+	c.conns = nil
+	c.streams = make(map[string]*connection)
+
 	if c.dataCh != nil {
 		close(c.dataCh)
 		c.dataCh = nil
