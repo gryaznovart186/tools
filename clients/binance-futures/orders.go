@@ -108,6 +108,39 @@ func (c *Client) GetOrder(ctx context.Context, symbol string, orderID int64) (*m
 	return &order, nil
 }
 
+func (c *Client) OpenOrders(ctx context.Context, symbol string) ([]models.Order, error) {
+	if err := c.checkCredentials(); err != nil {
+		return nil, err
+	}
+	params := url.Values{}
+	if symbol != "" {
+		params.Set("symbol", symbol)
+	}
+
+	fullQuery := c.withSignature(params.Encode())
+
+	resp, err := c.rc.R().
+		SetContext(ctx).
+		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		Get("/fapi/v1/openOrders?" + fullQuery)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
+	}
+
+	var orders []models.Order
+	err = json.Unmarshal(resp.Body(), &orders)
+	if err != nil {
+		return nil, ErrInvalidResponse
+	}
+
+	return orders, nil
+}
+
 func (c *Client) CancelOrder(ctx context.Context, symbol string, orderID int64) (*models.Order, error) {
 	if err := c.checkCredentials(); err != nil {
 		return nil, err
