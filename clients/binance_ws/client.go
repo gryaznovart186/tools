@@ -95,6 +95,7 @@ type connection struct {
 	cancel context.CancelFunc
 
 	writeCh chan writeRequest
+	pumpWg  sync.WaitGroup // tracks writePump and pingPump for this connection
 	streams map[string]struct{}
 	mu      sync.Mutex
 }
@@ -142,13 +143,23 @@ func (conn *connection) ensureConnected() error {
 		return nil
 	}
 
+	// If there's an old cancel, cancel it and wait for old pumps to finish
 	if conn.cancel != nil {
 		conn.cancel()
+		conn.cancel = nil
+		pumpWg := &conn.pumpWg
+		conn.mu.Unlock()
+		pumpWg.Wait()
+		conn.mu.Lock()
 	}
+
 	conn.ctx, conn.cancel = context.WithCancel(conn.client.ctx)
 
 	c, _, err := conn.client.dialer.DialContext(conn.ctx, conn.client.endpoint, nil)
 	if err != nil {
+		conn.cancel()
+		conn.cancel = nil
+		conn.ctx = nil
 		conn.mu.Unlock()
 		return err
 	}
@@ -162,55 +173,64 @@ func (conn *connection) ensureConnected() error {
 	conn.conn = c
 	conn.writeCh = make(chan writeRequest, 100)
 
-	conn.client.wg.Add(2)
+	conn.pumpWg.Add(2)
 	go conn.writePump()
 	go conn.pingPump()
 
-	// Restore subscriptions
+	// Collect streams to restore while still holding the lock
+	var streamsToRestore []string
 	if len(conn.streams) > 0 {
-		all := make([]string, 0, len(conn.streams))
+		streamsToRestore = make([]string, 0, len(conn.streams))
 		for s := range conn.streams {
-			all = append(all, s)
-		}
-
-		conn.mu.Unlock()
-		err := conn.send("SUBSCRIBE", all)
-		conn.mu.Lock()
-		if err != nil {
-			if conn.conn != nil {
-				_ = conn.conn.Close()
-				conn.conn = nil
-			}
-			conn.mu.Unlock()
-			return err
+			streamsToRestore = append(streamsToRestore, s)
 		}
 	}
 
 	conn.mu.Unlock()
+
+	// Restore subscriptions outside the lock
+	if len(streamsToRestore) > 0 {
+		if err := conn.send("SUBSCRIBE", streamsToRestore); err != nil {
+			conn.closeConn()
+			return err
+		}
+	}
+
 	return nil
 }
 
-func (conn *connection) reconnect() {
+// closeConn closes the underlying websocket connection and waits for pump goroutines.
+// Safe to call concurrently.
+func (conn *connection) closeConn() {
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
 
 	if conn.cancel != nil {
 		conn.cancel()
 		conn.cancel = nil
 	}
 
-	if conn.writeCh != nil {
-		conn.writeCh = nil
-	}
+	// Don't close writeCh — writePump exits via ctx.Done().
+	// Just nil it out so send() returns ErrNotConnected.
+	conn.writeCh = nil
 
 	if conn.conn != nil {
 		_ = conn.conn.Close()
 		conn.conn = nil
 	}
+
+	pumpWg := &conn.pumpWg
+	conn.mu.Unlock()
+
+	// Wait for writePump and pingPump to finish outside the lock
+	pumpWg.Wait()
+}
+
+func (conn *connection) reconnect() {
+	conn.closeConn()
 }
 
 func (conn *connection) writePump() {
-	defer conn.client.wg.Done()
+	defer conn.pumpWg.Done()
 
 	conn.mu.Lock()
 	writeCh := conn.writeCh
@@ -225,11 +245,7 @@ func (conn *connection) writePump() {
 		select {
 		case <-ctx.Done():
 			return
-		case req, ok := <-writeCh:
-			if !ok {
-				return
-			}
-
+		case req := <-writeCh:
 			conn.mu.Lock()
 			c := conn.conn
 			conn.mu.Unlock()
@@ -253,7 +269,7 @@ func (conn *connection) writePump() {
 }
 
 func (conn *connection) pingPump() {
-	defer conn.client.wg.Done()
+	defer conn.pumpWg.Done()
 
 	conn.mu.Lock()
 	ctx := conn.ctx
@@ -280,7 +296,15 @@ func (conn *connection) pingPump() {
 			}
 
 			if err := c.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
-				go conn.reconnect()
+				// Don't call reconnect()/closeConn() from pingPump —
+				// it would deadlock on pumpWg.Wait() (waiting for itself).
+				// Just close the underlying net.Conn to unblock ReadMessage() in run().
+				// run() will handle the reconnection.
+				conn.mu.Lock()
+				if conn.conn != nil {
+					_ = conn.conn.Close()
+				}
+				conn.mu.Unlock()
 				return
 			}
 		}
@@ -301,27 +325,37 @@ func (conn *connection) send(method string, streams []string) error {
 		return err
 	}
 
+	result := make(chan error, 1)
+	req := writeRequest{data: data, result: result}
+
 	conn.mu.Lock()
 	if conn.writeCh == nil {
 		conn.mu.Unlock()
 		return ErrNotConnected
 	}
 
-	writeCh := conn.writeCh
 	ctx := conn.ctx
-	conn.mu.Unlock()
 
-	result := make(chan error, 1)
-	req := writeRequest{data: data, result: result}
-
+	// Try non-blocking write under mutex (buffer is 100, usually succeeds)
 	select {
-	case writeCh <- req:
+	case conn.writeCh <- req:
+		conn.mu.Unlock()
+	default:
+		// Buffer full — release mutex and wait
+		writeCh := conn.writeCh
+		conn.mu.Unlock()
+
 		select {
-		case err := <-result:
-			return err
+		case writeCh <- req:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+
+	// Wait for result outside the lock
+	select {
+	case err := <-result:
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -336,8 +370,12 @@ func (conn *connection) run() {
 		}
 
 		if err := conn.ensureConnected(); err != nil {
-			time.Sleep(time.Second)
-			continue
+			select {
+			case <-conn.client.ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
 		}
 
 		conn.mu.Lock()
@@ -345,15 +383,23 @@ func (conn *connection) run() {
 		conn.mu.Unlock()
 
 		if c == nil {
-			time.Sleep(time.Second)
-			continue
+			select {
+			case <-conn.client.ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
 		}
 
 		_, msg, err := c.ReadMessage()
 		if err != nil {
-			conn.reconnect()
-			time.Sleep(time.Second)
-			continue
+			conn.closeConn()
+			select {
+			case <-conn.client.ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
 		}
 
 		var streamMsg StreamData
@@ -409,11 +455,19 @@ func (c *BinanceWebsocketClient) Close() error {
 		c.cancel = nil
 	}
 
-	for _, conn := range c.conns {
-		conn.reconnect()
-	}
+	// Copy conns slice under lock, then release lock before calling closeConn
+	// to avoid deadlock (closeConn takes conn.mu, and run() goroutines may
+	// hold conn.mu while trying to send to dataCh which needs client context).
+	conns := make([]*connection, len(c.conns))
+	copy(conns, c.conns)
 	c.mu.Unlock()
 
+	// Close each connection and wait for their pump goroutines
+	for _, conn := range conns {
+		conn.closeConn()
+	}
+
+	// Wait for all run() goroutines
 	c.wg.Wait()
 
 	c.mu.Lock()
