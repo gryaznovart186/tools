@@ -3,6 +3,8 @@ package binance_ws
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -303,6 +305,7 @@ func (conn *connection) pingPump() {
 				conn.mu.Lock()
 				if conn.conn != nil {
 					_ = conn.conn.Close()
+					conn.conn = nil
 				}
 				conn.mu.Unlock()
 				return
@@ -361,6 +364,30 @@ func (conn *connection) send(method string, streams []string) error {
 	}
 }
 
+var errConnClosed = errors.New("websocket connection closed")
+
+// readMessage safely reads from the websocket connection, recovering from
+// panics caused by reading a connection that was closed by another goroutine.
+func (conn *connection) readMessage() (msg []byte, err error) {
+	conn.mu.Lock()
+	c := conn.conn
+	conn.mu.Unlock()
+
+	if c == nil {
+		return nil, errConnClosed
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			msg = nil
+			err = fmt.Errorf("websocket read panic: %v", r)
+		}
+	}()
+
+	_, msg, err = c.ReadMessage()
+	return msg, err
+}
+
 func (conn *connection) run() {
 	for {
 		select {
@@ -378,20 +405,7 @@ func (conn *connection) run() {
 			}
 		}
 
-		conn.mu.Lock()
-		c := conn.conn
-		conn.mu.Unlock()
-
-		if c == nil {
-			select {
-			case <-conn.client.ctx.Done():
-				return
-			case <-time.After(time.Second):
-				continue
-			}
-		}
-
-		_, msg, err := c.ReadMessage()
+		msg, err := conn.readMessage()
 		if err != nil {
 			conn.closeConn()
 			select {
