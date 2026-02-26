@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
@@ -63,5 +64,25 @@ func (c *Client) SendText(msg string) error {
 		return fmt.Errorf("api error, code: %d message: %s", reps.StatusCode(), reps.String())
 	}
 
+	return nil
+}
+
+// SendPhoto sends a photo with an optional caption to the chat associated with the client.
+func (c *Client) SendPhoto(caption string, photo []byte) error {
+	resp, err := c.restyClient.
+		SetTimeout(c.timeout).
+		R().
+		SetFormData(map[string]string{
+			"chat_id": c.chatID,
+			"caption": caption,
+		}).
+		SetFileReader("photo", "chart.png", bytes.NewReader(photo)).
+		Post(c.botUrl() + "/sendPhoto")
+	if err != nil {
+		return err
+	}
+	if resp.IsError() {
+		return fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
+	}
 	return nil
 }
