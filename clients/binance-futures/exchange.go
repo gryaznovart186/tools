@@ -51,6 +51,23 @@ func (c *Client) PriceChangeStats(ctx context.Context) ([]models.PriceChangeStat
 	return res, nil
 }
 
+func (c *Client) OpenInterest(ctx context.Context, symbol string) (models.OpenInterest, error) {
+	resp, err := c.rc.R().
+		SetContext(ctx).
+		SetQueryParam("symbol", symbol).
+		Get("/fapi/v1/openInterest")
+	if err != nil {
+		return models.OpenInterest{}, fmt.Errorf("failed to get open interest: %w", err)
+	}
+
+	var res models.OpenInterest
+	if err := json.Unmarshal(resp.Body(), &res); err != nil {
+		return models.OpenInterest{}, fmt.Errorf("failed to unmarshal open interest: %w", err)
+	}
+
+	return res, nil
+}
+
 func (c *Client) Klines(ctx context.Context, symbol, interval string, limit int, startTime, endTime int64) ([]models.Kline, error) {
 	req := c.rc.R().
 		SetContext(ctx).

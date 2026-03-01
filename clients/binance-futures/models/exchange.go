@@ -51,6 +51,12 @@ type PriceChangeStats struct {
 	Volume             float64 `json:"volume,string"`
 }
 
+type OpenInterest struct {
+	Symbol       string  `json:"symbol"`
+	OpenInterest float64 `json:"openInterest,string"`
+	Time         int64   `json:"time"`
+}
+
 type Kline struct {
 	OpenTime                 int64   `json:"openTime"`
 	Open                     float64 `json:"open,string"`
