@@ -2,9 +2,7 @@ package binance_futures
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 
 	"github.com/gryaznovart186/tools/clients/binance-futures/models"
 )
@@ -15,22 +13,18 @@ func (c *Client) AccountBalance(ctx context.Context) (*models.AccountBalance, er
 	}
 	fullQuery := c.withSignature("")
 
+	var balances []models.AccountBalance
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&balances).
 		Get("/fapi/v3/balance?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-	var balances []models.AccountBalance
-	err = json.Unmarshal(resp.Body(), &balances)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	for _, b := range balances {
@@ -48,23 +42,18 @@ func (c *Client) OpenedPositions(ctx context.Context) ([]models.Position, error)
 	}
 	fullQuery := c.withSignature("")
 
+	var openedPositions []models.Position
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&openedPositions).
 		Get("/fapi/v3/positionRisk?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var openedPositions []models.Position
-	err = json.Unmarshal(resp.Body(), &openedPositions)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return openedPositions, nil

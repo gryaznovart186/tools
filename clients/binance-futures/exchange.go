@@ -10,16 +10,16 @@ import (
 )
 
 func (c *Client) ExchangeSymbolsInfo(ctx context.Context, isOnlyInTrading bool) ([]models.SymbolInfo, error) {
+	var res models.ExchangeInfo
 	resp, err := c.rc.R().
 		SetContext(ctx).
+		SetResult(&res).
 		Get("/fapi/v1/exchangeInfo")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get exchange info: %w", err)
 	}
-
-	var res models.ExchangeInfo
-	if err := json.Unmarshal(resp.Body(), &res); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal exchange info: %w", err)
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	if isOnlyInTrading {
@@ -36,33 +36,33 @@ func (c *Client) ExchangeSymbolsInfo(ctx context.Context, isOnlyInTrading bool) 
 }
 
 func (c *Client) PriceChangeStats(ctx context.Context) ([]models.PriceChangeStats, error) {
-	req := c.rc.R().SetContext(ctx)
-
-	resp, err := req.Get("/fapi/v1/ticker/24hr")
+	var res []models.PriceChangeStats
+	resp, err := c.rc.R().
+		SetContext(ctx).
+		SetResult(&res).
+		Get("/fapi/v1/ticker/24hr")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get price change stats: %w", err)
 	}
-
-	var res []models.PriceChangeStats
-	if err := json.Unmarshal(resp.Body(), &res); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal price change stats: %w", err)
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return res, nil
 }
 
 func (c *Client) OpenInterest(ctx context.Context, symbol string) (models.OpenInterest, error) {
+	var res models.OpenInterest
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetQueryParam("symbol", symbol).
+		SetResult(&res).
 		Get("/fapi/v1/openInterest")
 	if err != nil {
 		return models.OpenInterest{}, fmt.Errorf("failed to get open interest: %w", err)
 	}
-
-	var res models.OpenInterest
-	if err := json.Unmarshal(resp.Body(), &res); err != nil {
-		return models.OpenInterest{}, fmt.Errorf("failed to unmarshal open interest: %w", err)
+	if resp.IsError() {
+		return models.OpenInterest{}, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return res, nil
@@ -84,24 +84,23 @@ func (c *Client) OpenInterestHist(ctx context.Context, symbol, period string, st
 	if startTime > 0 {
 		req.SetQueryParam("startTime", fmt.Sprintf("%d", startTime))
 	}
-
 	if endTime > 0 {
 		req.SetQueryParam("endTime", fmt.Sprintf("%d", endTime))
 	}
 
-	resp, err := req.Get("/futures/data/openInterestHist")
+	var res []models.OpenInterestHist
+	resp, err := req.SetResult(&res).Get("/futures/data/openInterestHist")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get open interest hist: %w", err)
 	}
-
-	var res []models.OpenInterestHist
-	if err := json.Unmarshal(resp.Body(), &res); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal open interest hist: %w", err)
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return res, nil
 }
 
+// Klines uses manual unmarshal because the API returns a raw 2D array, not a JSON object.
 func (c *Client) Klines(ctx context.Context, symbol, interval string, limit int, startTime, endTime int64) ([]models.Kline, error) {
 	req := c.rc.R().
 		SetContext(ctx).
@@ -113,11 +112,9 @@ func (c *Client) Klines(ctx context.Context, symbol, interval string, limit int,
 	if limit > 0 {
 		req.SetQueryParam("limit", fmt.Sprintf("%d", limit))
 	}
-
 	if startTime > 0 {
 		req.SetQueryParam("startTime", fmt.Sprintf("%d", startTime))
 	}
-
 	if endTime > 0 {
 		req.SetQueryParam("endTime", fmt.Sprintf("%d", endTime))
 	}
@@ -125,6 +122,9 @@ func (c *Client) Klines(ctx context.Context, symbol, interval string, limit int,
 	resp, err := req.Get("/fapi/v1/klines")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get klines: %w", err)
+	}
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	var rawKlines [][]any

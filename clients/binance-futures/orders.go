@@ -2,9 +2,7 @@ package binance_futures
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 
 	"github.com/gryaznovart186/tools/clients/binance-futures/models"
@@ -52,23 +50,18 @@ func (c *Client) CreateOrder(ctx context.Context, req *models.CreateOrderRequest
 
 	fullQuery := c.withSignature(params.Encode())
 
+	var order models.Order
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&order).
 		Post("/fapi/v1/order?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var order models.Order
-	err = json.Unmarshal(resp.Body(), &order)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return &order, nil
@@ -86,23 +79,18 @@ func (c *Client) GetOrder(ctx context.Context, symbol string, orderID int64) (*m
 
 	fullQuery := c.withSignature(params.Encode())
 
+	var order models.Order
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&order).
 		Get("/fapi/v1/order?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var order models.Order
-	err = json.Unmarshal(resp.Body(), &order)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return &order, nil
@@ -119,23 +107,18 @@ func (c *Client) OpenOrders(ctx context.Context, symbol string) ([]models.Order,
 
 	fullQuery := c.withSignature(params.Encode())
 
+	var orders []models.Order
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&orders).
 		Get("/fapi/v1/openOrders?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var orders []models.Order
-	err = json.Unmarshal(resp.Body(), &orders)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return orders, nil
@@ -153,23 +136,18 @@ func (c *Client) CancelOrder(ctx context.Context, symbol string, orderID int64) 
 
 	fullQuery := c.withSignature(params.Encode())
 
+	var order models.Order
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&order).
 		Delete("/fapi/v1/order?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var order models.Order
-	err = json.Unmarshal(resp.Body(), &order)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return &order, nil

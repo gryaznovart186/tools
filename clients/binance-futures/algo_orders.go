@@ -2,9 +2,7 @@ package binance_futures
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 
 	"github.com/gryaznovart186/tools/clients/binance-futures/models"
@@ -53,23 +51,18 @@ func (c *Client) CreateAlgoOrder(ctx context.Context, req *models.CreateAlgoOrde
 
 	fullQuery := c.withSignature(params.Encode())
 
+	var order models.AlgoOrder
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&order).
 		Post("/fapi/v1/algoOrder?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var order models.AlgoOrder
-	err = json.Unmarshal(resp.Body(), &order)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return &order, nil
@@ -84,23 +77,18 @@ func (c *Client) GetAlgoOrder(ctx context.Context, algoID int64) (*models.AlgoOr
 
 	fullQuery := c.withSignature(params.Encode())
 
+	var order models.AlgoOrder
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&order).
 		Get("/fapi/v1/algoOrder?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var order models.AlgoOrder
-	err = json.Unmarshal(resp.Body(), &order)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return &order, nil
@@ -117,23 +105,18 @@ func (c *Client) OpenAlgoOrders(ctx context.Context, symbol string) ([]models.Al
 
 	fullQuery := c.withSignature(params.Encode())
 
+	var orders []models.AlgoOrder
 	resp, err := c.rc.R().
 		SetContext(ctx).
 		SetHeader("X-MBX-APIKEY", c.creds.apiKey).
+		SetResult(&orders).
 		Get("/fapi/v1/openAlgoOrders?" + fullQuery)
 
 	if err != nil {
 		return nil, err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
-	}
-
-	var orders []models.AlgoOrder
-	err = json.Unmarshal(resp.Body(), &orders)
-	if err != nil {
-		return nil, ErrInvalidResponse
+	if resp.IsError() {
+		return nil, fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return orders, nil
@@ -156,9 +139,8 @@ func (c *Client) CancelAlgoOrder(ctx context.Context, algoID int64) error {
 	if err != nil {
 		return err
 	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode(), resp.Body())
+	if resp.IsError() {
+		return fmt.Errorf("api error, code: %d message: %s", resp.StatusCode(), resp.String())
 	}
 
 	return nil
