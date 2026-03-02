@@ -68,6 +68,40 @@ func (c *Client) OpenInterest(ctx context.Context, symbol string) (models.OpenIn
 	return res, nil
 }
 
+func (c *Client) OpenInterestHist(ctx context.Context, symbol, period string, startTime, endTime int64, limit int) ([]models.OpenInterestHist, error) {
+	req := c.rc.R().
+		SetContext(ctx).
+		SetQueryParams(map[string]string{
+			"symbol": symbol,
+			"period": period,
+		})
+
+	if limit <= 0 {
+		limit = 500
+	}
+	req.SetQueryParam("limit", fmt.Sprintf("%d", limit))
+
+	if startTime > 0 {
+		req.SetQueryParam("startTime", fmt.Sprintf("%d", startTime))
+	}
+
+	if endTime > 0 {
+		req.SetQueryParam("endTime", fmt.Sprintf("%d", endTime))
+	}
+
+	resp, err := req.Get("/futures/data/openInterestHist")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get open interest hist: %w", err)
+	}
+
+	var res []models.OpenInterestHist
+	if err := json.Unmarshal(resp.Body(), &res); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal open interest hist: %w", err)
+	}
+
+	return res, nil
+}
+
 func (c *Client) Klines(ctx context.Context, symbol, interval string, limit int, startTime, endTime int64) ([]models.Kline, error) {
 	req := c.rc.R().
 		SetContext(ctx).

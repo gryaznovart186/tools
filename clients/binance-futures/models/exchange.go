@@ -57,6 +57,13 @@ type OpenInterest struct {
 	Time         int64   `json:"time"`
 }
 
+type OpenInterestHist struct {
+	Symbol               string  `json:"symbol"`
+	SumOpenInterest      float64 `json:"sumOpenInterest,string"`
+	SumOpenInterestValue float64 `json:"sumOpenInterestValue,string"`
+	Timestamp            int64   `json:"timestamp"`
+}
+
 type Kline struct {
 	OpenTime                 int64   `json:"openTime"`
 	Open                     float64 `json:"open,string"`
