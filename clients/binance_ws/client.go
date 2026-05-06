@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	wsBaseEndpoint     = "wss://fstream.binance.com/stream"
-	testWsBaseEndpoint = "wss://stream.binancefuture.com/stream"
+	wsBaseEndpoint     = "wss://fstream.binance.com/market/stream"
+	testWsBaseEndpoint = "wss://stream.binancefuture.com/market/stream"
 
 	defaultHandshakeTimeout = 10 * time.Second
 	defaultReadBufferSize   = 8192
